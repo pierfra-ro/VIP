@@ -1,19 +1,23 @@
 #! /usr/bin/env python
 
 """
-Module with S/N calculation functions.
-We strongly recommend users to read Mawet et al. (2014) before using routines 
-of this module: https://ui.adsabs.harvard.edu/abs/2014ApJ...792...97M/abstract
+Module with S/N calculation functions. We strongly recommend users to read 
+[MAW14]_ before using routines of this module.
+
 """
 
 __author__ = 'Carlos Alberto Gomez Gonzalez, O. Absil @ ULg, V. Christiaens'
 __all__ = ['snr',
            'snrmap',
+           'indep_ap_centers',
            'significance',
            'frame_report']
 
 import numpy as np
-import photutils
+try:
+    from photutils.aperture import aperture_photometry, CircularAperture
+except:
+    from photutils import aperture_photometry, CircularAperture
 from scipy.stats import norm, t
 from hciplot import plot_frames
 from skimage.draw import disk, circle_perimeter
@@ -21,26 +25,25 @@ from matplotlib import pyplot as plt
 from astropy.convolution import convolve, Tophat2DKernel
 from astropy.stats import median_absolute_deviation as mad
 from multiprocessing import cpu_count
-from ..conf.utils_conf import pool_map, iterable, sep
-from ..conf import time_ini, timing, check_array
+from ..config.utils_conf import pool_map, iterable, sep
+from ..config import time_ini, timing, check_array
 from ..var import get_annulus_segments, frame_center, dist
 
 
 def snrmap(array, fwhm, approximated=False, plot=False, known_sources=None,
-           nproc=None, array2=None, use2alone=False, 
+           nproc=None, array2=None, use2alone=False,
            exclude_negative_lobes=False, verbose=True, **kwargs):
     """Parallel implementation of the S/N map generation function. Applies the
     S/N function (small samples penalty) at each pixel.
-    
-    The S/N is computed as in Mawet et al. (2014) for each radial separation.    
-    https://ui.adsabs.harvard.edu/abs/2014ApJ...792...97M/abstract
-    
-    *** DISCLAIMER ***
-    Signal-to-noise ratio is not significance! For a conversion from snr to 
-    n-sigma (i.e. the equivalent confidence level of a Gaussian n-sigma), use 
-    the significance() function.    
-    
-    
+
+    The S/N is computed as in [MAW14]_ for each radial separation.
+
+    **DISCLAIMER**:
+    Signal-to-noise ratio is not significance! For a conversion from SNR to
+    n-sigma (i.e. the equivalent confidence level of a Gaussian n-sigma), use
+    the ``significance`` function.
+
+
     Parameters
     ----------
     array : numpy ndarray
@@ -58,11 +61,11 @@ def snrmap(array, fwhm, approximated=False, plot=False, known_sources=None,
     nproc : int or None
         Number of processes for parallel computing.
     array2 : numpy ndarray, optional
-        Additional image (e.g. processed image with negative derotation angles) 
-        enabling to have more noise samples. Should have the 
+        Additional image (e.g. processed image with negative derotation angles)
+        enabling to have more noise samples. Should have the
         same dimensions as array.
     use2alone: bool, optional
-        Whether to use array2 alone to estimate the noise (might be useful to 
+        Whether to use array2 alone to estimate the noise (might be useful to
         estimate the snr of extended disk features).
     verbose: bool, optional
         Whether to print timing or not.
@@ -170,7 +173,7 @@ def snrmap(array, fwhm, approximated=False, plot=False, known_sources=None,
             coor_ann = [(x, y) for (x, y) in zip(annx, anny) if (x, y) not in
                         zip(cirx, ciry)]
             res = pool_map(nproc, snr, arr_masked_sources, iterable(coor_ann),
-                           fwhm, True, array2, use2alone, 
+                           fwhm, True, array2, use2alone,
                            exclude_negative_lobes)
             res = np.array(res, dtype=object)
             yy_res = res[:, 0]
@@ -218,30 +221,125 @@ def _snr_approx(array, source_xy, fwhm, centery, centerx):
     return sourcey, sourcex, snr_value
 
 
+def indep_ap_centers(array, source_xy, fwhm, exclude_negative_lobes=False,
+                     exclude_theta_range=None, no_gap=False):
+    """
+    Define independent aperture centers at a given radial separation, starting
+    from a test location provided with source_xy.
+
+    Parameters
+    ----------
+    array : numpy ndarray, 2d
+        Frame in which the apertures will be defined (its dimensions are used).
+    source_xy : tuple of floats
+        X and Y coordinates of the planet or test speckle.
+    fwhm : float
+        Size in pixels of the FWHM, corresponding to the diameter of the
+        non-overlapping apertures.
+    exclude_negative_lobes : bool, opt
+        Whether to include the adjacent aperture lobes to the tested location
+        or not. Can be set to True if the image shows significant neg lobes.
+    exclude_theta_range : tuple of 2 floats or None, opt
+        If provided, range of trigonometric angles  in deg (measured from
+        positive x axis), to be avoided for apertures used for noise estimation.
+        WARNING: this is to be used wisely, e.g. only if a known authentic
+        circumstellar signal is biasing the SNR estimate.
+    no_gap: bool, opt
+        Whether an overlapping aperture is defined between the first and last
+        non-overlapping aperture (at the end of making a full circle), in order
+        to leave no gap. False by default.
+
+    Returns
+    -------
+    (yy, xx) : tuple of 2 numpy ndarray
+        Tuple containing y and x coordinates of the apertures
+    """
+    sourcex, sourcey = source_xy
+    centery, centerx = frame_center(array)
+    sep = dist(centery, centerx, float(sourcey), float(sourcex))
+    theta_0 = np.rad2deg(np.arctan2(sourcey - centery, sourcex - centerx))
+
+    if exclude_theta_range is not None:
+        exc_theta_range = list(exclude_theta_range)
+
+    if not sep > (fwhm / 2) + 1:
+        raise RuntimeError('`source_xy` is too close to the frame center')
+
+    # sens = 'clock'  # counterclock
+    # assumes clockwise rotation when building test apertures
+    # change sign and conditions if counterclockwise
+    sign = -1
+    if exclude_theta_range is not None:
+        if theta_0 > exc_theta_range[0] and theta_0 < exc_theta_range[1]:
+            exc_theta_range[0] += 360
+        while theta_0 < exc_theta_range[1]:
+            theta_0 += 360
+    theta = theta_0
+
+    angle = np.arcsin(fwhm / 2. / sep) * 2
+    number_apertures = int(np.floor(2 * np.pi / angle))
+    if no_gap:
+        # if requested, add an (overlapping) aperture to avoid a gap
+        number_apertures += 1
+
+    yy = []
+    xx = []
+    yy_all = np.zeros(number_apertures)
+    xx_all = np.zeros(number_apertures)
+    cosangle = np.cos(angle)
+    sinangle = np.sin(angle)
+    xx.append(sourcex - centerx)
+    yy.append(sourcey - centery)
+    xx_all[0] = sourcex - centerx
+    yy_all[0] = sourcey - centery
+
+    for i in range(number_apertures - 1):
+        xx_all[i + 1] = cosangle * xx_all[i] - sign * sinangle * yy_all[i]
+        yy_all[i + 1] = cosangle * yy_all[i] + sign * sinangle * xx_all[i]
+        theta += sign * np.rad2deg(angle)
+        if exclude_negative_lobes and (i == 0 or i == number_apertures - 2):
+            continue
+        if exclude_theta_range is None:
+            xx.append(cosangle * xx_all[i] - sign * sinangle * yy_all[i])
+            yy.append(cosangle * yy_all[i] + sign * sinangle * xx_all[i])
+        else:
+            if theta < exc_theta_range[0] or theta > exc_theta_range[1]:
+                xx.append(cosangle * xx_all[i] - sign * sinangle * yy_all[i])
+                yy.append(cosangle * yy_all[i] + sign * sinangle * xx_all[i])
+
+    xx = np.array(xx)
+    yy = np.array(yy)
+
+    xx += centerx
+    yy += centery
+
+    return yy, xx
+
+
 def snr(array, source_xy, fwhm, full_output=False, array2=None, use2alone=False,
-        exclude_negative_lobes=False, plot=False, verbose=False):
+        exclude_negative_lobes=False, exclude_theta_range=None, plot=False,
+        verbose=False):
     """
     Calculate the S/N (signal to noise ratio) of a test resolution element
     in a residual frame (e.g. post-processed with LOCI, PCA, etc). Implements
-    the approach described in Mawet et al. 2014 on small sample statistics,
+    the approach described in [MAW14]_ on small sample statistics,
     where a student t-test (eq. 9) can be used to determine S/N (and contrast)
-    in high contrast imaging. 3 extra possibilities compared to Mawet et al. 
-    2014 (https://ui.adsabs.harvard.edu/abs/2014ApJ...792...97M/abstract):
+    in high contrast imaging. 3 extra possibilities compared to [MAW14]_:
 
         * possibility to provide a second array (e.g. obtained with opposite \
         derotation angles) to have more apertures for noise estimation;
-            
+
         * possibility to exclude negative ADI lobes directly adjacent to the \
         tested xy location, to not bias the noise estimate;
-        
+
         * possibility to use only the second array for the noise estimation \
         (useful for images containing a lot of disk/extended signals).
-        
+
     *** DISCLAIMER ***
-    Signal-to-noise ratio is not significance! For a conversion from snr to 
-    n-sigma (i.e. the equivalent confidence level of a Gaussian n-sigma), use 
-    the significance() function.    
-    
+    Signal-to-noise ratio is not significance! For a conversion from snr to
+    n-sigma (i.e. the equivalent confidence level of a Gaussian n-sigma), use
+    the significance() function.
+
     Parameters
     ----------
     array : numpy ndarray, 2d
@@ -254,17 +352,22 @@ def snr(array, source_xy, fwhm, full_output=False, array2=None, use2alone=False,
         If True returns back the S/N value, the y, x input coordinates, noise
         and flux.
     array2 : None or numpy ndarray, 2d, optional
-        Additional image (e.g. processed image with negative derotation angles) 
+        Additional image (e.g. processed image with negative derotation angles)
         enabling to have more apertures for noise estimation at each radial
         separation. Should have the same dimensions as array.
     use2alone : bool, opt
-        Whether to use array2 alone to estimate the noise (can be useful to 
+        Whether to use array2 alone to estimate the noise (can be useful to
         estimate the S/N of extended disk features)
     exclude_negative_lobes : bool, opt
-        Whether to include the adjacent aperture lobes to the tested location 
+        Whether to include the adjacent aperture lobes to the tested location
         or not. Can be set to True if the image shows significant neg lobes.
+    exclude_theta_range : tuple of 2 floats or None, opt
+        If provided, range of trigonometric angles  in deg (measured from 
+        positive x axis), to be avoided for apertures used for noise estimation.
+        WARNING: this is to be used wisely, e.g. only if a known authentic 
+        circumstellar signal is biasing the SNR estimate.
     plot : bool, optional
-        Plots the frame and the apertures considered for clarity. 
+        Plots the frame and the apertures considered for clarity.
     verbose: bool, optional
         Chooses whether to print some output or not.
 
@@ -279,7 +382,7 @@ def snr(array, source_xy, fwhm, full_output=False, array2=None, use2alone=False,
         [full_output=True] Flux in test elemnt.
     fluxes : numpy ndarray
         [full_output=True] Background apertures fluxes.
-    [always:]    
+    [always:]
     snr_vale : float
         Value of the S/N for the given test resolution element.
     """
@@ -291,44 +394,18 @@ def snr(array, source_xy, fwhm, full_output=False, array2=None, use2alone=False,
             raise TypeError('`array2` has not the same shape as input array')
 
     sourcex, sourcey = source_xy
-    centery, centerx = frame_center(array)
-    sep = dist(centery, centerx, float(sourcey), float(sourcex))
 
-    if not sep > (fwhm/2)+1:
-        raise RuntimeError('`source_xy` is too close to the frame center')
+    yy, xx = indep_ap_centers(array, source_xy, fwhm, exclude_negative_lobes,
+                              exclude_theta_range)
 
-    sens = 'clock'  # counterclock
-
-    angle = np.arcsin(fwhm/2./sep)*2
-    number_apertures = int(np.floor(2*np.pi/angle))
-    yy = np.zeros((number_apertures))
-    xx = np.zeros((number_apertures))
-    cosangle = np.cos(angle)
-    sinangle = np.sin(angle)
-    xx[0] = sourcex - centerx
-    yy[0] = sourcey - centery
-    for i in range(number_apertures-1):
-        if sens == 'clock':
-            xx[i+1] = cosangle*xx[i] + sinangle*yy[i] 
-            yy[i+1] = cosangle*yy[i] - sinangle*xx[i] 
-        elif sens == 'counterclock':
-            xx[i+1] = cosangle*xx[i] - sinangle*yy[i] 
-            yy[i+1] = cosangle*yy[i] + sinangle*xx[i]
-
-    xx += centerx
-    yy += centery
     rad = fwhm/2.
-    if exclude_negative_lobes:
-        xx = np.concatenate(([xx[0]], xx[2:-1]))
-        yy = np.concatenate(([yy[0]], yy[2:-1]))
 
-    apertures = photutils.CircularAperture(zip(xx, yy), r=rad)  # Coordinates (X,Y)
-    fluxes = photutils.aperture_photometry(array, apertures, method='exact')
+    apertures = CircularAperture(zip(xx, yy), r=rad)  # Coordinates (X,Y)
+    fluxes = aperture_photometry(array, apertures, method='exact')
     fluxes = np.array(fluxes['aperture_sum'])
 
     if array2 is not None:
-        fluxes2 = photutils.aperture_photometry(array2, apertures,
-                                                method='exact')
+        fluxes2 = aperture_photometry(array2, apertures, method='exact')
         fluxes2 = np.array(fluxes2['aperture_sum'])
         if use2alone:
             fluxes = np.concatenate(([fluxes[0]], fluxes2[:]))
@@ -354,7 +431,7 @@ def snr(array, source_xy, fwhm, full_output=False, array2=None, use2alone=False,
 
     if plot:
         _, ax = plt.subplots(figsize=(6, 6))
-        ax.imshow(array, origin='lower', interpolation='nearest', alpha=0.5, 
+        ax.imshow(array, origin='lower', interpolation='nearest', alpha=0.5,
                   cmap='gray')
         for i in range(xx.shape[0]):
             # Circle takes coordinates as (X,Y)
@@ -376,13 +453,12 @@ def snr(array, source_xy, fwhm, full_output=False, array2=None, use2alone=False,
         return snr_vale
 
 
-
 def significance(snr, rad, fwhm, student_to_gauss=True):
-    """ Converts a S/N ratio (measured as in Mawet et al. 2014) into the 
-    equivalent gaussian significance, i.e. the n-sigma with the same confidence 
+    """ Converts a S/N ratio (measured as in [MAW14]_) into the
+    equivalent gaussian significance, i.e. the n-sigma with the same confidence
     level as the S/N at the given separation.
-     
-     
+
+
     Parameters
     ----------
     snr : float or numpy array
@@ -394,27 +470,28 @@ def significance(snr, rad, fwhm, student_to_gauss=True):
     fwhm : float
         Full Width Half Maximum of the PSF.
     student_to_gauss : bool, optional
-        Whether the conversion is from Student SNR to Gaussian significance. If 
+        Whether the conversion is from Student SNR to Gaussian significance. If
         False, will assume the opposite: Gaussian significance to Student SNR.
-    
+
     Returns
     -------
     sigma : float
         Gaussian significance in terms of n-sigma
-    
+
     """
-    
+
     if student_to_gauss:
-        sigma = norm.ppf(t.cdf(snr,(rad/fwhm)*2*np.pi-2))
-        if t.cdf(snr,(rad/fwhm)*2*np.pi-2)==1.0:
+        sigma = norm.ppf(t.cdf(snr, (rad/fwhm)*2*np.pi-2))
+        if t.cdf(snr, (rad/fwhm)*2*np.pi-2) == 1.0:
             print("Warning high S/N! cdf>0.9999999999999999 is rounded to 1")
-            print(r"Returning 8.2 instead of inf. Quote detection>8.2 $\sigma$")
+            msg = "Returning 8.2 sigma, but quote significance > 8.2 sigma."
+            print(msg)
             return 8.2
     else:
         sigma = t.ppf(norm.cdf(snr), (rad/fwhm)*2*np.pi-2)
-        
-    return sigma      
-            
+
+    return sigma
+
 
 def frame_report(array, fwhm, source_xy=None, verbose=True):
     """ Gets information from given frame: Integrated flux in aperture, S/N of
@@ -464,9 +541,8 @@ def frame_report(array, fwhm, source_xy=None, verbose=True):
                 print('Coords of chosen px (X,Y) = {:.1f}, {:.1f}'.format(x, y))
 
             # we get integrated flux on aperture with diameter=1FWHM
-            aper = photutils.CircularAperture((x, y), r=fwhm / 2.)
-            obj_flux_i = photutils.aperture_photometry(array, aper,
-                                                       method='exact')
+            aper = CircularAperture((x, y), r=fwhm / 2.)
+            obj_flux_i = aperture_photometry(array, aper, method='exact')
             obj_flux_i = obj_flux_i['aperture_sum'][0]
 
             # we get the mean and stddev of SNRs on aperture
@@ -474,7 +550,7 @@ def frame_report(array, fwhm, source_xy=None, verbose=True):
             snr_pixels_i = [snr(array, (x_, y_), fwhm, plot=False,
                                 verbose=False) for y_, x_ in zip(yy, xx)]
             meansnr_i = np.mean(snr_pixels_i)
-            stdsnr_i = np.std(snr_pixels_i,ddof=1)
+            stdsnr_i = np.std(snr_pixels_i, ddof=1)
             pxsnr_i = snr(array, (x, y), fwhm, plot=False, verbose=False)
 
             obj_flux.append(obj_flux_i)
@@ -504,8 +580,8 @@ def frame_report(array, fwhm, source_xy=None, verbose=True):
             print('Coords of Max px (X,Y) = {:.1f}, {:.1f}'.format(x, y))
 
         # we get integrated flux on aperture with diameter=1FWHM
-        aper = photutils.CircularAperture((x, y), r=fwhm / 2.)
-        obj_flux_i = photutils.aperture_photometry(array, aper, method='exact')
+        aper = CircularAperture((x, y), r=fwhm / 2.)
+        obj_flux_i = aperture_photometry(array, aper, method='exact')
         obj_flux_i = obj_flux_i['aperture_sum'][0]
 
         # we get the mean and stddev of SNRs on aperture
@@ -513,7 +589,7 @@ def frame_report(array, fwhm, source_xy=None, verbose=True):
         snr_pixels_i = [snr(array, (x_, y_), fwhm, plot=False,
                             verbose=False) for y_, x_ in zip(yy, xx)]
         meansnr_pixels = np.mean(snr_pixels_i)
-        stdsnr_i = np.std(snr_pixels_i,ddof=1)
+        stdsnr_i = np.std(snr_pixels_i, ddof=1)
         pxsnr_i = snr(array, (x, y), fwhm, plot=False, verbose=False)
 
         obj_flux.append(obj_flux_i)

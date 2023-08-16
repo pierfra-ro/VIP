@@ -3,15 +3,16 @@ scipy
 astropy
 photutils
 scikit-learn
-scikit-image
-emcee
+scikit-image>0.17.0, <=0.18.3
+emcee==2.2.1
 nestle
 corner
 pandas
-matplotlib
+matplotlib>=3.7.0
 psutil
 pyprind
 munch
-opencv-python
-pytest
-hciplot
+nbsphinx
+hciplot>=0.2.4
+typing
+dataclass_builder

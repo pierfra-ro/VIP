@@ -6,7 +6,6 @@ Also functions for cropping cubes.
 """
 
 
-
 __author__ = 'Carlos Alberto Gomez Gonzalez, V. Christiaens'
 __all__ = ['cube_crop_frames',
            'cube_drop_frames',
@@ -16,10 +15,27 @@ __all__ = ['cube_crop_frames',
            'approx_stellar_position']
 
 
+from multiprocessing import cpu_count
 import numpy as np
 from astropy.stats import sigma_clipped_stats
+from ..config.utils_conf import pool_map, iterable
 from ..stats import sigma_filter
 from ..var import frame_center, get_square
+from multiprocessing import Process
+import multiprocessing
+from multiprocessing import set_start_method
+shared_mem = True
+try:
+   from multiprocessing import shared_memory
+except ImportError:
+   print('Failed to import shared_memory from multiprocessing')
+   try:
+      print('Trying to import shared_memory directly(for python 3.7)')
+      import shared_memory
+   except ModuleNotFoundError:
+       shared_mem = False
+       print("WARNING: multiprocessing unavailable for bad pixel correction.")
+       print('Either pip install shared-memory38, or upgrade to python>=3.8')
 
 
 def cube_crop_frames(array, size, xy=None, force=False, verbose=True,
@@ -100,7 +116,10 @@ def frame_crop(array, size, cenxy=None, force=False, verbose=True):
         Coordinates of the center of the subframe.
     force : bool, optional
         Size and the size of the 2d array must be both even or odd. With
-        ``force`` set to True this condition can be avoided.
+        ``force`` set to False, the requested size is flexible (i.e. +1 can be
+        applied to requested crop size for its parity to match the input size).
+        If ``force`` set to True, the requested crop size is enforced, even if
+        parities do not match (warnings are raised!).
     verbose : bool optional
         If True, a message of completion is shown.
 
@@ -125,29 +144,33 @@ def frame_crop(array, size, cenxy=None, force=False, verbose=True):
     return array_view
 
 
-def frame_pad(array, fac, fillwith=0, loc=0, scale=1, full_output=False):
+def frame_pad(array, fac, fillwith=0, loc=0, scale=1, keep_parity=True, 
+              full_output=False):
     """ Pads a frame (2d array) equally on each sides, where the final frame
-    size is set by a multiplicative factor applied to the original size. The 
-    padding is set by fillwith, which can be either a fixed value or white 
+    size is set by a multiplicative factor applied to the original size. The
+    padding is set by fillwith, which can be either a fixed value or white
     noise, characterized by (loc, scale).
     Uses the ``get_square`` function.
 
     Parameters
     ----------
-    array : numpy ndarray
+    array : 2D numpy ndarray
         Input frame.
-    fac : float > 1.
-        Ratio of the size between padded and input frame.
+    fac : float > 1 or tuple of 2 floats > 1.
+        Ratio of the size between padded and input frame. If a tuple, 
+        corresponds to padding factors along the y and x dimensions resp.
     fillwith : float or str, optional
         If a float or np.nan: value used for padding.
-        If str, must be 'noise', which will inject white noise, using loc and 
+        If str, must be 'noise', which will inject white noise, using loc and
         scale parameters.
     loc : float, optional
         If padding noise, mean of the white noise.
     scale : float, optional
         If padding noise, standard deviation of the white noise.
+    keep_parity : bool, optional
+        Whether keep parity of dimensions after padding.
     full_output : bool, optional
-        Whether to also return the indices of input frame within the padded 
+        Whether to also return the indices of input frame within the padded
         frame (in addition to padded frame).
 
     Returns
@@ -155,40 +178,52 @@ def frame_pad(array, fac, fillwith=0, loc=0, scale=1, full_output=False):
     array_out : numpy ndarray
         Padded array.
     ori_indices: tuple
-        [returned if full_output=True] Indices of the bottom left and top 
+        [returned if full_output=True] Indices of the bottom left and top
         right vertices of the original image within the padded array:
-        (y0, yN, x0, xN).  
+        (y0, yN, x0, xN).
 
     """
-    
-    if not array.ndim==2:
+
+    if not array.ndim == 2:
         raise TypeError("The input array must be 2d")
-    
-    y,x = array.shape
-    cy_ori, cx_ori = frame_center(array)
-    new_y = int(y*fac)
-    new_x = int(x*fac)
-    if new_y%2 != y%2:
-        new_y-=1
-    if new_x%2 != x%2:
-        new_x-=1
-    if fillwith == 'noise':
-        array_out = np.random.normal(loc=loc, scale=scale, size=(new_y,new_x))
+    if np.isscalar(fac):
+        if fac < 1:
+            raise ValueError("fac should be larger than 1")
     else:
-        array_out = np.zeros([new_y,new_x],dtype=array.dtype)
+        if fac[0] < 1 or fac[-1] < 1:
+            raise ValueError("fac elements should be larger than 1")
+
+    y, x = array.shape
+    cy_ori, cx_ori = frame_center(array)
+    if np.isscalar(fac):
+        fac = [fac, fac]
+    new_y = int(y*fac[0])
+    new_x = int(x*fac[1])
+    if new_y % 2 != y % 2 and keep_parity:
+        new_y -= 1
+    if new_x % 2 != x % 2 and keep_parity:
+        new_x -= 1
+    if fillwith == 'noise':
+        array_out = np.random.normal(loc=loc, scale=scale, size=(new_y, new_x))
+    else:
+        array_out = np.zeros([new_y, new_x], dtype=array.dtype)
         array_out[:] = fillwith
     cy, cx = frame_center(array_out)
     y0 = int(cy-cy_ori)
     y1 = int(cy+cy_ori)
-    if new_y%2:
-        y1+=1
+    if y1-y0 < y:
+        y1 += 1
+    elif y1-y0 > y:
+        y1 -= 1
     x0 = int(cx-cx_ori)
     x1 = int(cx+cx_ori)
-    if new_x%2:
-        x1+=1
-    array_out[y0:y1,x0:x1] = array.copy()
-    ori_indices =  (y0, y1, x0, x1)
-    
+    if x1-x0 < x:
+        x1 += 1
+    elif x1-x0 > x:
+        x1 -= 1
+    array_out[y0:y1, x0:x1] = array.copy()
+    ori_indices = (y0, y1, x0, x1)
+
     if full_output:
         return array_out, ori_indices
     else:
@@ -197,7 +232,7 @@ def frame_pad(array, fac, fillwith=0, loc=0, scale=1, full_output=False):
 
 def cube_drop_frames(array, n, m, parallactic=None, verbose=True):
     """
-    Slice the cube so that all frames between ``n``and ``m`` are kept.
+    Slice the cube so that all frames between ``n`` and ``m`` are kept.
 
     Operates on axis 0 for 3D cubes, and on axis 1 for 4D cubes. This returns a
     modified *copy* of ``array``. The indices ``n`` and ``m`` are included and
@@ -262,12 +297,12 @@ def frame_remove_stripes(array):
     lines = np.vstack((lines, array[-50:]))
     mean = lines.mean(axis=0)
     for i in range(array.shape[1]):
-        array[:,i] = array[:,i] - mean[i]
+        array[:, i] = array[:, i] - mean[i]
     return array
 
 
 def cube_correct_nan(cube, neighbor_box=3, min_neighbors=3, verbose=False,
-                     half_res_y=False):
+                     half_res_y=False, nproc=1):
     """Sigma filtering of nan pixels in a whole frame or cube. Tested on
     SINFONI data.
 
@@ -288,44 +323,15 @@ def cube_correct_nan(cube, neighbor_box=3, min_neighbors=3, verbose=False,
         is twice less angular resolution vertically than horizontally (e.g.
         SINFONI data). The algorithm goes twice faster if this option is
         rightfully set to True.
+    nproc: None or int, optional
+        Number of CPUs for multiprocessing (only used for 3D input). If None,
+        will automatically set it to half the available number of CPUs.
 
     Returns
     -------
     obj_tmp : numpy ndarray
         Output cube with corrected nan pixels in each frame
     """
-    def nan_corr_2d(obj_tmp):
-        n_x = obj_tmp.shape[1]
-        n_y = obj_tmp.shape[0]
-
-        if half_res_y:
-            if n_y % 2 != 0:
-                raise ValueError("The input frames do not have an even number "
-                                 "of rows. Hence, you should probably not be "
-                                 "using the option half_res_y = True.")
-            n_y = int(n_y / 2)
-            frame = obj_tmp
-            obj_tmp = np.zeros([n_y, n_x])
-            for yy in range(n_y):
-                obj_tmp[yy] = frame[2 * yy]
-
-        # tuple with the 2D indices of each nan value of the frame
-        nan_indices = np.where(np.isnan(obj_tmp))
-        nan_map = np.zeros_like(obj_tmp)
-        nan_map[nan_indices] = 1
-        nnanpix = int(np.sum(nan_map))
-        # Correct nan with iterative sigma filter
-        obj_tmp = sigma_filter(obj_tmp, nan_map, neighbor_box=neighbor_box,
-                               min_neighbors=min_neighbors, verbose=verbose)
-        if half_res_y:
-            frame = obj_tmp
-            n_y = 2 * n_y
-            obj_tmp = np.zeros([n_y, n_x])
-            for yy in range(n_y):
-                obj_tmp[yy] = frame[int(yy / 2)]
-
-        return obj_tmp, nnanpix
-    ############################################################################
 
     obj_tmp = cube.copy()
 
@@ -342,17 +348,63 @@ def cube_correct_nan(cube, neighbor_box=3, min_neighbors=3, verbose=False,
         print(msg.format(max_neigh))
 
     if ndims == 2:
-        obj_tmp, nnanpix = nan_corr_2d(obj_tmp)
+        obj_tmp, nnanpix = nan_corr_2d(obj_tmp, neighbor_box, min_neighbors, 
+                                       half_res_y, verbose, True)
         if verbose:
             print("{} NaN pixels were corrected".format(nnanpix))
 
     elif ndims == 3:
+        if nproc is None:
+            nproc = cpu_count()//2
         n_z = obj_tmp.shape[0]
-        for zz in range(n_z):
-            obj_tmp[zz], nnanpix = nan_corr_2d(obj_tmp[zz])
+        if nproc == 1 or not shared_mem:
+            for zz in range(n_z):
+                obj_tmp[zz], nnanpix = nan_corr_2d(obj_tmp[zz], neighbor_box,
+                                                   min_neighbors, half_res_y,
+                                                   verbose, True)
+                if verbose:
+                    msg = "In channel {}, {} NaN pixels were corrected"
+                    print(msg.format(zz, nnanpix))
+        else:
+            #dummy calling the function to prevent compiling of the function by individual workers
+            #This should save some time. 
+            dummy_obj = nan_corr_2d(obj_tmp[0], neighbor_box, min_neighbors, half_res_y, verbose, full_output=False)
             if verbose:
-                msg = "In channel {}, {} NaN pixels were corrected"
-                print(msg.format(zz, nnanpix))
+                msg = "Correcting NaNs in multiprocessing using ADACS' approach..."
+                print(msg)
+            #creation of shared memory blob
+            shm = shared_memory.SharedMemory(create=True, size=obj_tmp.nbytes)
+            #creating an array object similar to obj_tmp and occupying shared memory.
+            obj_tmp_shared=np.ndarray(obj_tmp.shape, dtype=obj_tmp.dtype, buffer=shm.buf)
+            #nan_corr_2d_mp function passes the frame and other details to nan_corr_2d for processing.
+            def nan_corr_2d_mp(i,obj, neighbor_box, min_neighbors, half_res_y, verbose):
+                obj_tmp_shared[i]=nan_corr_2d(obj, neighbor_box, min_neighbors, half_res_y,verbose,full_output=False)
+            # _nan_corr_2d unfolds the arguments
+            global _nan_corr_2d_mp
+            def _nan_corr_2d_mp(args):
+                   nan_corr_2d_mp(*args)
+            
+            context=multiprocessing.get_context('fork')
+            #processes argumnet is not provided to pool as no. of processes is 
+            #inferred from os.cpu_count()
+            pool=context.Pool(processes=nproc, maxtasksperchild=1)
+            #creating a list of arguments
+            args=[]
+            for j in range(n_z):
+                args.append([j, obj_tmp[j], neighbor_box, min_neighbors, half_res_y, verbose])
+            try:
+                pool.map_async(_nan_corr_2d_mp,args, chunksize=1 ).get(timeout=10_000_000)
+            finally:
+                pool.close()
+                pool.join()
+                obj_tmp[:]=obj_tmp_shared[:]
+                shm.close()
+                shm.unlink()
+            #Original Multiprocessing code commented out below and ADACS approach is activated. 
+            # res = pool_map(nproc, nan_corr_2d, iterable(obj_tmp), neighbor_box,
+            #                min_neighbors, half_res_y, verbose, False)
+            # obj_tmp = np.array(res, dtype=object)
+
 
     if verbose:
         print('All nan pixels are corrected.')
@@ -360,9 +412,50 @@ def cube_correct_nan(cube, neighbor_box=3, min_neighbors=3, verbose=False,
     return obj_tmp
 
 
+def nan_corr_2d(obj_tmp, neighbor_box, min_neighbors, half_res_y, verbose,
+                full_output=True):
+
+    n_x = obj_tmp.shape[1]
+    n_y = obj_tmp.shape[0]
+
+    if half_res_y:
+        if n_y % 2 != 0:
+            raise ValueError("The input frames do not have an even number "
+                             "of rows. Hence, you should probably not be "
+                             "using the option half_res_y = True.")
+        n_y = int(n_y / 2)
+        frame = obj_tmp
+        obj_tmp = np.zeros([n_y, n_x])
+        for yy in range(n_y):
+            obj_tmp[yy] = frame[2 * yy]
+
+    # tuple with the 2D indices of each nan value of the frame
+    nan_indices = np.where(np.isnan(obj_tmp))
+    nan_map = np.zeros_like(obj_tmp)
+    nan_map[nan_indices] = 1
+    nnanpix = int(np.sum(nan_map))
+    # Correct nan with iterative sigma filter
+    obj_tmp = sigma_filter(obj_tmp, nan_map, neighbor_box=neighbor_box,
+                           min_neighbors=min_neighbors, verbose=verbose,
+                           half_res_y=half_res_y)
+    if half_res_y:
+        frame = obj_tmp
+        n_y = 2 * n_y
+        obj_tmp = np.zeros([n_y, n_x])
+        for yy in range(n_y):
+            obj_tmp[yy] = frame[int(yy / 2)]
+
+    if full_output:
+        return obj_tmp, nnanpix
+    else:
+        return obj_tmp
+
+
 def approx_stellar_position(cube, fwhm, return_test=False, verbose=False):
-    """FIND THE APPROX COORDS OF THE STAR IN EACH CHANNEL (even the ones
-    dominated by noise)
+    """Finds the approximate coordinates of the star, assuming it is the
+    brightest signal in the images. The algorithm can handle images dominated
+    by noise, since outliers are corrected based on the position of ths star in
+    other channels.
 
     Parameters
     ----------
@@ -380,10 +473,13 @@ def approx_stellar_position(cube, fwhm, return_test=False, verbose=False):
     verbose: bool, optional
         Chooses whether to print some additional information.
 
-    Returns:
-    --------
-    Array of y and x approx coordinates of the star in each channel of the cube
-    if return_test: it also returns the test result vector
+    Returns
+    -------
+    star_approx_idx: 2d numpy array
+        Array of y and x approximate coordinates of the star in each channel of 
+        the cube. Dimensions are nz x 2.
+    test_result: 1d numpy array
+        [return_test=True] It also returns the test result vector.
     """
     from ..metrics import peak_coordinates
 
@@ -395,7 +491,8 @@ def approx_stellar_position(cube, fwhm, return_test=False, verbose=False):
         fwhm = np.zeros((n_z))
         fwhm[:] = fwhm_scal
 
-    # 1/ Write a 2-columns array with indices of all max pixel values in the cube
+    # 1/ Write a 2-columns array with indices of all max pixel values in the
+    # cube
     star_tmp_idx = np.zeros([n_z, 2])
     star_approx_idx = np.zeros([n_z, 2])
     test_result = np.ones(n_z)
@@ -436,7 +533,7 @@ def approx_stellar_position(cube, fwhm, return_test=False, verbose=False):
                 inf_neigh = max(0, zz - ii)
                 sup_neigh = min(n_z - 1, zz + ii)
             if test_result[inf_neigh] == 1 and test_result[sup_neigh] == 1:
-                star_approx_idx[zz] = np.floor((star_tmp_idx[sup_neigh] + \
+                star_approx_idx[zz] = np.floor((star_tmp_idx[sup_neigh] +
                                                 star_tmp_idx[inf_neigh]) / 2)
             elif test_result[inf_neigh] == 1:
                 star_approx_idx[zz] = star_tmp_idx[inf_neigh]
